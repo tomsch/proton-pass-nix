@@ -1,0 +1,67 @@
+name: Auto Update
+
+on:
+  schedule:
+    - cron: '0 7 * * *'  # Daily at 7:00 UTC
+  workflow_dispatch:      # Manual trigger
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Check for updates
+        id: check
+        run: |
+          # Download latest .deb and extract version
+          TEMP_DIR=$(mktemp -d)
+          curl -sL "https://proton.me/download/PassDesktop/linux/x64/ProtonPass.deb" -o "$TEMP_DIR/proton-pass.deb"
+          cd "$TEMP_DIR"
+          ar x proton-pass.deb
+          tar -xf control.tar.* 2>/dev/null || tar -xzf control.tar.gz 2>/dev/null
+          VERSION=$(grep "^Version:" control | cut -d' ' -f2)
+
+          CURRENT=$(grep 'version = ' $GITHUB_WORKSPACE/package.nix | head -1 | sed 's/.*"\(.*\)".*/\1/')
+
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "latest=$VERSION" >> $GITHUB_OUTPUT
+
+          if [ "$VERSION" != "$CURRENT" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update package
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          VERSION="${{ steps.check.outputs.latest }}"
+
+          # Get new hash
+          HASH=$(nix-prefetch-url "https://proton.me/download/pass/linux/x64/proton-pass_${VERSION}_amd64.deb" 2>&1 | tail -1)
+          SRI_HASH=$(nix hash convert --to sri --hash-algo sha256 "$HASH")
+
+          # Update package.nix
+          sed -i "s/version = \".*\"/version = \"$VERSION\"/" package.nix
+          sed -i "s|hash = \"sha256-.*\"|hash = \"$SRI_HASH\"|" package.nix
+
+      - name: Test build
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          nix build .#proton-pass --accept-flake-config
+
+      - name: Commit and push
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.nix
+          git commit -m "Update proton-pass to ${{ steps.check.outputs.latest }}"
+          git push
